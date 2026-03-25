@@ -2,109 +2,129 @@ import os
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
+import glob
 import re
 
-# --- Constants ---
-R_CONSTANT = 1.987204e-3 
+# Constants
+R_CONSTANT = 1.987204e-3
+STRUCT_COLS = ['atomic_fluctuation', 'deformation_energy', 'phi', 'psi', 'rsa', 'residue_depth']
+DIRS = {
+    'sig': 'data/features/signatures',
+    'dyn': 'data/features/dynamics',
+    'env': 'data/features/residue_env',
+    'pharma': 'data/features/pharma_deltas',
+    'evo': 'data/features/evolutionary'
+}
 
-def parse_mutations(mut_str):
-    results = []
-    parts = str(mut_str).split(',')
-    for p in parts:
-        match = re.search(r"([A-Za-z0-9])([A-Z])(\d+)([A-Z])", p.strip())
-        if match:
-            results.append((match.group(1), int(match.group(3))))
-    return results
-
-def find_file_case_insensitive(directory, filename_pattern):
-    if not os.path.exists(directory): return None
-    files = os.listdir(directory)
-    pattern_lower = filename_pattern.lower()
-    for f in files:
-        if f.lower() == pattern_lower:
-            return os.path.join(directory, f)
-    return None
-
-# --- Setup Paths ---
-mut_path = 'data/processed/multiple_mutations_all.csv'
-dyn_dir = 'data/features/dynamics'
-env_dir = 'data/features/residue_env'
-sig_dir = 'data/features/signatures'
-
-df = pd.read_csv(mut_path)
-df.columns = [c.strip() for c in df.columns]
-final_data = []
-
-# Define the full set of expected structural columns
-STRUCTURAL_COLS = ['atomic_fluctuation', 'deformation_energy', 'phi', 'psi', 'rsa', 'residue_depth']
-
-print(f"Merging features for {len(df)} SKEMPI entries...")
-
-for idx, row in tqdm(df.iterrows(), total=len(df)):
-    pdb_id_full = str(row['#Pdb']).strip()
-    pdb_code = pdb_id_full.split('_')[0]
+def get_struct_values(df_dyn, df_env, mut_string):
+    """
+    Robust matching that handles string/int mismatches and chain whitespace.
+    """
+    vals = []
+    # Standardize: RA83Q or R A 83 Q -> WT: R, Chain: A, Res: 83
+    mut_list = str(mut_string).split(',')
     
-    # 1. Signature Check
-    sig_filename = f"row_{idx}_{pdb_id_full}_sig.csv"
-    sig_path = find_file_case_insensitive(sig_dir, sig_filename)
-    if not sig_path: continue
+    # Pre-clean columns to ensure fast, reliable matching
+    if not df_env.empty:
+        df_env['res_id'] = df_env['res_id'].astype(str).str.strip()
+        df_env['chain'] = df_env['chain'].astype(str).str.strip()
+    if not df_dyn.empty:
+        df_dyn['residue_index'] = df_dyn['residue_index'].astype(str).str.strip()
 
-    # 2. Affinity Check
+    for m in mut_list:
+        m = m.strip()
+        # Use Regex to extract WT, Chain, and ResNum
+        match = re.search(r'([A-Za-z])\s*([A-Za-z])\s*(\d+)', m)
+        if not match: continue
+            
+        chain_id = match.group(2).strip().upper()
+        res_num_str = match.group(3).strip()
+        
+        # 1. Environment Match (RSA/Depth)
+        env_match = df_env[(df_env['res_id'] == res_num_str) & (df_env['chain'] == chain_id)]
+        
+        # 2. Dynamics Match (NMA)
+        # Often sequential, so we try the ResNum directly first
+        dyn_match = df_dyn[df_dyn['residue_index'] == res_num_str]
+        
+        res_data = {}
+        if not env_match.empty:
+            res_data.update(env_match.iloc[0].to_dict())
+        if not dyn_match.empty:
+            res_data.update(dyn_match.iloc[0].to_dict())
+            
+        if res_data:
+            vals.append(res_data)
+                
+    if vals:
+        # Convert to numeric for averaging, ignore non-numeric columns
+        mean_vals = pd.DataFrame(vals).apply(pd.to_numeric, errors='coerce').mean().to_dict()
+        return {c: round(mean_vals.get(c, 0.0), 5) for c in STRUCT_COLS}
+    return {c: 0.0 for c in STRUCT_COLS}
+
+# --- 1. Load Master SKEMPI ---
+print("📖 Loading SKEMPI Master...")
+skempi = pd.read_csv('data/raw/skempi_v2.csv', sep=';')
+for col in ['Temperature', 'Affinity_mut_parsed', 'Affinity_wt_parsed']:
+    skempi[col] = pd.to_numeric(skempi[col], errors='coerce')
+skempi['ddG_target'] = R_CONSTANT * skempi['Temperature'] * np.log(skempi['Affinity_mut_parsed'] / skempi['Affinity_wt_parsed'])
+
+# --- 2. Hybrid Merge Logic ---
+sig_files = glob.glob(os.path.join(DIRS['sig'], "row_*_sig.csv"))
+print(f"🔎 Found {len(sig_files)} samples. Merging...")
+
+final_rows = []
+found_struct_count = 0
+diagnostic_done = False
+
+for f_sig in tqdm(sig_files):
+    fname = os.path.basename(f_sig)
+    parts = fname.split('_')
+    row_idx = int(parts[1])
+    pdb_id = parts[2].upper()
+    mut_prefix = "_".join(parts[:-1])
+
+    if row_idx >= len(skempi): continue
+    skempi_row = skempi.iloc[row_idx]
+    if pd.isna(skempi_row['ddG_target']): continue
+    
+    mut_str = skempi_row['Mutation(s)_PDB']
+
+    # Define paths
+    paths = {
+        'evo': os.path.join(DIRS['evo'], f"{mut_prefix}_evo.csv"),
+        'delta': os.path.join(DIRS['pharma'], f"{mut_prefix}_delta.csv"),
+        'dyn': os.path.join(DIRS['dyn'], f"{pdb_id}_dynamics.csv"),
+        'env': os.path.join(DIRS['env'], f"{pdb_id}_env.csv")
+    }
+
+    if not all(os.path.exists(p) for p in paths.values()): continue
+        
     try:
-        kd_wt = pd.to_numeric(row['Affinity_wt_parsed'], errors='coerce')
-        kd_mut = pd.to_numeric(row['Affinity_mut_parsed'], errors='coerce')
-        temp = pd.to_numeric(row['Temperature'], errors='coerce')
-        if np.isnan(temp): temp = 298.15
-        if np.isnan(kd_wt) or np.isnan(kd_mut) or kd_wt <= 0 or kd_mut <= 0: continue
-        ddG_target = R_CONSTANT * temp * np.log(kd_mut / kd_wt)
+        struct_feats = get_struct_values(pd.read_csv(paths['dyn']), pd.read_csv(paths['env']), mut_str)
+        
+        # Diagnostic: Show us the first match to confirm it's working
+        if not diagnostic_done and struct_feats['rsa'] > 0:
+            print(f"\n✅ Diagnostic Match for {pdb_id} {mut_str}:")
+            print(f"   RSA: {struct_feats['rsa']}, Fluctuation: {struct_feats['atomic_fluctuation']}")
+            diagnostic_done = True
+
+        if struct_feats['rsa'] > 0: found_struct_count += 1
+        
+        combined = {
+            'pdb_id': pdb_id, 'mutation': mut_str, 'ddG_target': round(skempi_row['ddG_target'], 5),
+            **pd.read_csv(f_sig).iloc[0].to_dict(),
+            **struct_feats,
+            **pd.read_csv(paths['delta']).iloc[0, 2:].to_dict(),
+            **pd.read_csv(paths['evo']).iloc[0, 2:].to_dict()
+        }
+        final_rows.append(combined)
     except: continue
 
-    # 3. Aggregation Block
-    dyn_path = find_file_case_insensitive(dyn_dir, f"{pdb_code}_dynamics.csv")
-    env_path = find_file_case_insensitive(env_dir, f"{pdb_code}_env.csv")
-    
-    res_features = {col: 0.0 for col in STRUCTURAL_COLS} # Initialize with zeros
-    
-    if dyn_path and env_path:
-        d_df, e_df = pd.read_csv(dyn_path), pd.read_csv(env_path)
-        mut_list = parse_mutations(row['Mutation(s)_PDB'])
-        site_vals = []
-        
-        for ch, r_id in mut_list:
-            d_match = d_df[d_df['residue_index'] == r_id]
-            e_match = e_df[(e_df['res_id'] == r_id) & (e_df['chain'].str.upper() == ch.upper())]
-            
-            # Combine whatever data is available
-            row_dict = {}
-            if not d_match.empty:
-                row_dict.update(d_match.iloc[0].to_dict())
-            if not e_match.empty:
-                row_dict.update(e_match.iloc[0].to_dict())
-            
-            if row_dict:
-                site_vals.append(row_dict)
-        
-        if site_vals:
-            agg_df = pd.DataFrame(site_vals)
-            # Calculate mean only for columns that exist, others stay 0.0
-            for col in STRUCTURAL_COLS:
-                if col in agg_df.columns:
-                    res_features[col] = agg_df[col].mean()
-
-# 4. Final Success Merge (Including the human-readable mutation label)
-    sig_features = pd.read_csv(sig_path).iloc[0].to_dict()
-    final_data.append({
-        'pdb_id': pdb_id_full, 
-        'mutation': row['Mutation(s)_PDB'], # The "Label" you wanted
-        'location': row['iMutation_Location(s)'], # Also very useful for debugging!
-        'ddG_target': ddG_target, 
-        **res_features, 
-        **sig_features
-    })
-
-if final_data:
-    master_df = pd.DataFrame(final_data)
-    master_df.to_csv('data/processed/master_features.csv', index=False)
-    print(f"\n[Success] Final dataset: {len(master_df)} samples, {master_df.shape[1]} columns.")
-else:
-    print("\n[Error] No rows were merged.")
+# --- 3. Final Save ---
+if final_rows:
+    master_df = pd.DataFrame(final_rows)
+    os.makedirs('data/processed', exist_ok=True)
+    master_df.to_csv('data/processed/mmcsm_features.csv', index=False)
+    print(f"\n✅ Success! Dataset assembled: {len(master_df)} samples.")
+    print(f"📊 Structural data successfully mapped for {found_struct_count} samples.")
