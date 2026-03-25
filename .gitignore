@@ -1,0 +1,18 @@
+# Python environment
+__pycache__/
+venv/
+.env
+
+# Data - DO NOT TRACK (Too large/Redundant)
+data/pdb/
+data/features/
+data/processed/master_features.csv
+
+# Keep the folder structure, but not the files
+!data/pdb/.gitkeep
+!data/features/.gitkeep
+!data/processed/.gitkeep
+
+# Output plots and logs
+*.log
+model_performance.png
